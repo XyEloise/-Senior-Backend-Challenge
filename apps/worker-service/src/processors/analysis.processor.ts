@@ -1,63 +1,187 @@
 import mongoose from 'mongoose';
-import type { AnalysisRequestedEvent, AnalysisJob, Demographics, ThirdPartyApiResponse } from '@senior-challenge/shared-types';
+import type {
+    AnalysisRequestedEvent,
+    Demographics,
+    ThirdPartyApiResponse,
+} from '@senior-challenge/shared-types';
 import type { MessageProcessor } from './processor.interface';
 
 const MONGODB_URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27017/analysis_db';
 
+type JobStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+
+type JobDocument = {
+    jobId: string;
+    status: JobStatus;
+    version?: number;
+    [key: string]: unknown;
+};
+
 /**
  * Analysis Processor - processes analysis jobs from the queue.
  *
- * ⚠️ 警告：这段代码存在多个问题！
- * 1. 也在写入 demographics，与 LegacyApp 冲突
- * 2. 没有处理第三方 API 数据格式错误
- * 3. 日志非常糟糕，无法追踪问题
+ * 修复内容：
+ * 1. Worker 成为 demographics 的唯一计算与写入入口
+ * 2. 使用 version + 条件更新实现乐观锁，避免脏写
+ * 3. 增加结构化日志，提升可观测性
+ * 4. 对第三方 API 脏数据进行清洗与校验
  */
 export class AnalysisProcessor implements MessageProcessor {
     private connection: mongoose.Connection | null = null;
 
     constructor() {
-        this.initializeDatabase();
+        void this.initializeDatabase();
+    }
+
+    private log(level: 'log' | 'warn' | 'error', message: string, context: Record<string, unknown> = {}): void {
+        const entry = {
+            level,
+            component: 'AnalysisProcessor',
+            message,
+            timestamp: new Date().toISOString(),
+            ...context,
+        };
+
+        const line = JSON.stringify(entry);
+        if (level === 'error') {
+            console.error(line);
+            return;
+        }
+        if (level === 'warn') {
+            console.warn(line);
+            return;
+        }
+        console.log(line);
     }
 
     private async initializeDatabase(): Promise<void> {
         try {
             await mongoose.connect(MONGODB_URI);
             this.connection = mongoose.connection;
-            console.log('Connected to MongoDB'); // ⚠️ BUG: 应该用结构化日志
+            this.log('log', 'Connected to MongoDB', {
+                stage: 'DB_CONNECT',
+                mongoUri: MONGODB_URI,
+            });
         } catch (error) {
-            console.log('DB connection failed'); // ⚠️ BUG: 没有错误详情
+            const err = error as Error;
+            this.log('error', 'Failed to connect to MongoDB', {
+                stage: 'DB_CONNECT',
+                mongoUri: MONGODB_URI,
+                errorMessage: err.message,
+                stack: err.stack,
+            });
         }
     }
 
     /**
      * Processes an analysis request.
      *
-     * ⚠️ BUG: 这个方法也在写入 demographics，
-     * 但 LegacyApp 的 delayedUpdate 可能会覆盖这里的结果！
+     * 状态流：PENDING -> PROCESSING -> COMPLETED / FAILED
      */
     async process(event: AnalysisRequestedEvent): Promise<void> {
-        const { jobId, dataUrl } = event;
+        const { jobId, dataUrl, traceId } = event;
+        const logContext = {
+            jobId,
+            traceId: traceId ?? jobId,
+            dataUrl,
+        };
 
-        console.log('Processing job: ' + jobId); // ⚠️ BUG: 没有结构化日志
+        this.log('log', 'Received analysis event', {
+            ...logContext,
+            stage: 'EVENT_RECEIVED',
+        });
 
         try {
-            // 更新状态为 PROCESSING
-            await this.updateJobStatus(jobId, 'PROCESSING');
+            const currentJob = await this.findJob(jobId);
+            if (!currentJob) {
+                this.log('error', 'Job not found', {
+                    ...logContext,
+                    stage: 'LOAD_JOB',
+                });
+                return;
+            }
 
-            // 模拟调用第三方 API
+            const currentVersion = typeof currentJob.version === 'number' ? currentJob.version : 0;
+
+            const locked = await this.transitionJobStatus(
+                jobId,
+                currentVersion,
+                'PENDING',
+                'PROCESSING',
+                {
+                    ...logContext,
+                    stage: 'SET_PROCESSING',
+                },
+            );
+
+            if (!locked) {
+                this.log('warn', 'Skipped processing because optimistic lock failed', {
+                    ...logContext,
+                    stage: 'SET_PROCESSING',
+                    expectedVersion: currentVersion,
+                    status: 'PENDING',
+                });
+                return;
+            }
+
             const apiResponse = await this.callThirdPartyApi(dataUrl);
 
-            // ⚠️ BUG: 没有验证 API 响应格式！
-            // 如果 apiResponse.data 格式不对，这里会崩溃
-            const demographics = this.transformApiResponse(apiResponse);
+            this.log('log', 'Third-party API responded', {
+                ...logContext,
+                stage: 'THIRD_PARTY_RESPONSE',
+                apiSuccess: apiResponse.success,
+                rawData: apiResponse.data ?? null,
+            });
 
-            // ⚠️ BUG: 无条件写入，可能被 LegacyApp 的 delayedUpdate 覆盖
-            await this.updateJobWithResults(jobId, demographics);
+            const demographics = this.transformApiResponseSafe(apiResponse, logContext);
 
-            console.log('Job completed: ' + jobId); // ⚠️ BUG: 没有结构化日志
+            this.log('log', 'Normalized demographics payload', {
+                ...logContext,
+                stage: 'NORMALIZATION_COMPLETED',
+                demographics,
+            });
+
+            const completed = await this.updateJobWithResults(
+                jobId,
+                currentVersion + 1,
+                demographics,
+                {
+                    ...logContext,
+                    stage: 'PERSIST_RESULT',
+                },
+            );
+
+            if (!completed) {
+                this.log('warn', 'Skipped final write because optimistic lock failed', {
+                    ...logContext,
+                    stage: 'PERSIST_RESULT',
+                    expectedVersion: currentVersion + 1,
+                    status: 'PROCESSING',
+                });
+                return;
+            }
+
+            this.log('log', 'Job completed', {
+                ...logContext,
+                stage: 'COMPLETED',
+                status: 'COMPLETED',
+                demographics,
+            });
         } catch (error) {
-            console.log('Error happened'); // ⚠️ BUG: 没有任何有用信息！
-            await this.updateJobStatus(jobId, 'FAILED');
+            const err = error as Error;
+
+            this.log('error', 'Processing failed', {
+                ...logContext,
+                stage: 'FAILED',
+                status: 'FAILED',
+                errorMessage: err.message,
+                stack: err.stack,
+            });
+
+            await this.markJobFailed(jobId, err.message, {
+                ...logContext,
+                stage: 'FAILED_PERSIST',
+            });
         }
     }
 
@@ -66,12 +190,9 @@ export class AnalysisProcessor implements MessageProcessor {
      * Returns "dirty" data with various format issues.
      */
     private async callThirdPartyApi(dataUrl: string): Promise<ThirdPartyApiResponse> {
-        // 模拟 API 延迟
         await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 1000));
 
-        // 模拟各种脏数据场景
         const scenarios: ThirdPartyApiResponse[] = [
-            // 正常数据
             {
                 success: true,
                 data: {
@@ -83,7 +204,6 @@ export class AnalysisProcessor implements MessageProcessor {
                     score: 0.85,
                 },
             },
-            // ⚠️ 脏数据：age 是字符串
             {
                 success: true,
                 data: {
@@ -91,11 +211,10 @@ export class AnalysisProcessor implements MessageProcessor {
                     gender: 'male',
                     country: 'UK',
                     city: null,
-                    tags: 'lifestyle,food', // ⚠️ 应该是数组，但返回了字符串
-                    score: '0.72', // ⚠️ 应该是数字，但返回了字符串
+                    tags: 'lifestyle,food',
+                    score: '0.72',
                 },
             },
-            // ⚠️ 脏数据：缺少关键字段
             {
                 success: true,
                 data: {
@@ -109,35 +228,196 @@ export class AnalysisProcessor implements MessageProcessor {
             },
         ];
 
-        // 随机返回一种场景
         return scenarios[Math.floor(Math.random() * scenarios.length)];
     }
 
     /**
-     * Transforms API response to Demographics.
-     *
-     * ⚠️ BUG: 没有类型校验！如果字段格式不对，会崩溃或产生错误数据
+     * ✅ 修复：安全转换第三方 API 响应
+     * - 不再直接 data.age as number
+     * - 不再直接 data.tags as string[]
+     * - 不再直接 data.score as number
      */
-    private transformApiResponse(response: ThirdPartyApiResponse): Demographics {
-        const data = response.data!;
+    private transformApiResponseSafe(
+        response: ThirdPartyApiResponse,
+        logContext: Record<string, unknown>,
+    ): Demographics {
+        if (!response.success || !response.data) {
+            this.log('warn', 'Third-party API returned empty or unsuccessful payload', {
+                ...logContext,
+                stage: 'NORMALIZE_RESPONSE',
+                apiSuccess: response.success,
+            });
 
-        // ⚠️ BUG: 直接使用，没有校验类型
-        // 如果 data.age 是 "25+" 字符串，这里会有问题
-        // 如果 data.tags 是逗号分隔的字符串而不是数组，这里会有问题
+            return {
+                ageRange: 'unknown',
+                gender: 'unknown',
+                location: 'unknown',
+                interests: [],
+                confidence: 0,
+            };
+        }
+
+        const data = response.data;
+
+        const age = this.normalizeAge(data.age, logContext);
+        const gender = this.normalizeGender(data.gender, logContext);
+        const location = this.normalizeLocation(data.country, data.city, logContext);
+        const interests = this.normalizeTags(data.tags, logContext);
+        const confidence = this.normalizeScore(data.score, logContext);
+
         return {
-            ageRange: this.calculateAgeRange(data.age as number), // ⚠️ 危险的类型断言！
-            gender: data.gender as string,
-            location: data.country as string,
-            interests: data.tags as string[], // ⚠️ 可能是字符串，不是数组！
-            confidence: data.score as number,
+            ageRange: this.calculateAgeRangeSafe(age),
+            gender,
+            location,
+            interests,
+            confidence,
         };
     }
 
+    private normalizeAge(age: unknown, logContext: Record<string, unknown>): number | null {
+        if (typeof age === 'number' && Number.isFinite(age)) {
+            return age;
+        }
+
+        if (typeof age === 'string') {
+            const parsed = Number.parseInt(age, 10);
+            if (!Number.isNaN(parsed)) {
+                this.log('warn', 'Normalized non-numeric age string', {
+                    ...logContext,
+                    stage: 'NORMALIZE_AGE',
+                    originalAge: age,
+                    normalizedAge: parsed,
+                });
+                return parsed;
+            }
+        }
+
+        this.log('warn', 'Age missing or invalid', {
+            ...logContext,
+            stage: 'NORMALIZE_AGE',
+            originalAge: age ?? null,
+        });
+
+        return null;
+    }
+
+    private normalizeGender(gender: unknown, logContext: Record<string, unknown>): string {
+        if (typeof gender === 'string' && gender.trim().length > 0) {
+            return gender.trim().toLowerCase();
+        }
+
+        this.log('warn', 'Gender missing or invalid, defaulted to unknown', {
+            ...logContext,
+            stage: 'NORMALIZE_GENDER',
+            originalGender: gender ?? null,
+            normalizedGender: 'unknown',
+        });
+
+        return 'unknown';
+    }
+
+    private normalizeLocation(
+        country: unknown,
+        city: unknown,
+        logContext: Record<string, unknown>,
+    ): string {
+        if (typeof country === 'string' && country.trim().length > 0) {
+            return country.trim();
+        }
+
+        if (typeof city === 'string' && city.trim().length > 0) {
+            this.log('warn', 'Country missing, fallback to city', {
+                ...logContext,
+                stage: 'NORMALIZE_LOCATION',
+                originalCountry: country ?? null,
+                originalCity: city,
+                normalizedLocation: city.trim(),
+            });
+            return city.trim();
+        }
+
+        this.log('warn', 'Location missing, defaulted to unknown', {
+            ...logContext,
+            stage: 'NORMALIZE_LOCATION',
+            originalCountry: country ?? null,
+            originalCity: city ?? null,
+            normalizedLocation: 'unknown',
+        });
+
+        return 'unknown';
+    }
+
+    private normalizeTags(tags: unknown, logContext: Record<string, unknown>): string[] {
+        if (Array.isArray(tags)) {
+            return tags
+                .filter((tag): tag is string => typeof tag === 'string')
+                .map((tag) => tag.trim())
+                .filter(Boolean);
+        }
+
+        if (typeof tags === 'string') {
+            const normalizedTags = tags
+                .split(',')
+                .map((tag) => tag.trim())
+                .filter(Boolean);
+
+            this.log('warn', 'Normalized string tags into array', {
+                ...logContext,
+                stage: 'NORMALIZE_TAGS',
+                originalTags: tags,
+                normalizedTags,
+            });
+
+            return normalizedTags;
+        }
+
+        this.log('warn', 'Tags missing or invalid, defaulted to empty array', {
+            ...logContext,
+            stage: 'NORMALIZE_TAGS',
+            originalTags: tags ?? null,
+            normalizedTags: [],
+        });
+
+        return [];
+    }
+
+    private normalizeScore(score: unknown, logContext: Record<string, unknown>): number {
+        if (typeof score === 'number' && Number.isFinite(score)) {
+            return score;
+        }
+
+        if (typeof score === 'string') {
+            const parsed = Number.parseFloat(score);
+            if (!Number.isNaN(parsed)) {
+                this.log('warn', 'Normalized string score into number', {
+                    ...logContext,
+                    stage: 'NORMALIZE_SCORE',
+                    originalScore: score,
+                    normalizedScore: parsed,
+                });
+                return parsed;
+            }
+        }
+
+        this.log('warn', 'Score missing or invalid, defaulted to 0', {
+            ...logContext,
+            stage: 'NORMALIZE_SCORE',
+            originalScore: score ?? null,
+            normalizedScore: 0,
+        });
+
+        return 0;
+    }
+
     /**
-     * Calculates age range from a numeric age.
-     * ⚠️ BUG: 如果传入的不是数字（比如 "25+"），会返回 undefined
+     * ✅ 修复：安全年龄段计算
+     * 避免 null / 非法值导致错误年龄段
      */
-    private calculateAgeRange(age: number): string {
+    private calculateAgeRangeSafe(age: number | null): string {
+        if (age === null || !Number.isFinite(age) || age < 0) {
+            return 'unknown';
+        }
+
         if (age < 18) return 'under-18';
         if (age < 25) return '18-24';
         if (age < 35) return '25-34';
@@ -146,30 +426,118 @@ export class AnalysisProcessor implements MessageProcessor {
         return '55+';
     }
 
-    private async updateJobStatus(jobId: string, status: string): Promise<void> {
-        const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) return;
+    private async findJob(jobId: string): Promise<JobDocument | null> {
+        const collection = this.connection?.collection<JobDocument>('analysis_jobs');
+        if (!collection) {
+            throw new Error('Database not connected');
+        }
 
-        await collection.updateOne(
-            { jobId },
-            { $set: { status, updatedAt: new Date().toISOString() } },
-        );
+        return collection.findOne({ jobId });
     }
 
-    private async updateJobWithResults(jobId: string, demographics: Demographics): Promise<void> {
+    private async transitionJobStatus(
+        jobId: string,
+        expectedVersion: number,
+        fromStatus: JobStatus,
+        toStatus: JobStatus,
+        logContext: Record<string, unknown>,
+    ): Promise<boolean> {
         const collection = this.connection?.collection('analysis_jobs');
-        if (!collection) return;
+        if (!collection) {
+            throw new Error('Database not connected');
+        }
 
-        await collection.updateOne(
-            { jobId },
+        const result = await collection.updateOne(
+            { jobId, status: fromStatus, version: expectedVersion },
+            {
+                $set: {
+                    status: toStatus,
+                    updatedAt: new Date().toISOString(),
+                },
+                $inc: {
+                    version: 1,
+                },
+            },
+        );
+
+        this.log('log', 'Attempted job status transition', {
+            ...logContext,
+            fromStatus,
+            toStatus,
+            expectedVersion,
+            matchedCount: result.matchedCount,
+            modifiedCount: result.modifiedCount,
+        });
+
+        return result.modifiedCount === 1;
+    }
+
+    private async updateJobWithResults(
+        jobId: string,
+        expectedVersion: number,
+        demographics: Demographics,
+        logContext: Record<string, unknown>,
+    ): Promise<boolean> {
+        const collection = this.connection?.collection('analysis_jobs');
+        if (!collection) {
+            throw new Error('Database not connected');
+        }
+
+        const now = new Date().toISOString();
+        const result = await collection.updateOne(
+            { jobId, status: 'PROCESSING', version: expectedVersion },
             {
                 $set: {
                     status: 'COMPLETED',
                     demographics,
-                    updatedAt: new Date().toISOString(),
-                    completedAt: new Date().toISOString(),
+                    updatedAt: now,
+                    completedAt: now,
+                },
+                $inc: {
+                    version: 1,
                 },
             },
         );
+
+        this.log('log', 'Attempted to persist final job result', {
+            ...logContext,
+            expectedVersion,
+            matchedCount: result.matchedCount,
+            modifiedCount: result.modifiedCount,
+        });
+
+        return result.modifiedCount === 1;
+    }
+
+    private async markJobFailed(
+        jobId: string,
+        errorMessage: string,
+        logContext: Record<string, unknown>,
+    ): Promise<void> {
+        const collection = this.connection?.collection('analysis_jobs');
+        if (!collection) {
+            return;
+        }
+
+        const result = await collection.updateOne(
+            { jobId },
+            {
+                $set: {
+                    status: 'FAILED',
+                    error: errorMessage,
+                    updatedAt: new Date().toISOString(),
+                },
+                $inc: {
+                    version: 1,
+                },
+            },
+        );
+
+        this.log('log', 'Marked job as FAILED', {
+            ...logContext,
+            matchedCount: result.matchedCount,
+            modifiedCount: result.modifiedCount,
+            errorMessage,
+        });
     }
 }

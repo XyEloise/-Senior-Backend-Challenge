@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { AnalysisRequestedEvent } from '@senior-challenge/shared-types';
 
-const QUEUE_DIR = path.join(process.cwd(), 'local-queue');
+// const QUEUE_DIR = path.join(process.cwd(), 'local-queue');
+const QUEUE_DIR = path.resolve(__dirname, '../../../../../local-queue');
 
 /**
  * Message Queue service - simulates SQS for local development.

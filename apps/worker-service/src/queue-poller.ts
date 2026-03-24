@@ -2,8 +2,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { AnalysisRequestedEvent } from '@senior-challenge/shared-types';
 import type { MessageProcessor } from './processors/processor.interface';
+import { capturePayload } from './middleware/capture.middleware';
 
-const QUEUE_DIR = path.join(process.cwd(), 'local-queue');
+// const QUEUE_DIR = path.join(process.cwd(), 'local-queue');
+// path.resolve(__dirname, '../../../local-queue')
+const QUEUE_DIR = path.resolve(__dirname, '../../../local-queue');
 const POLL_INTERVAL_MS = 1000;
 
 /**
@@ -43,7 +46,13 @@ export class QueuePoller {
     private async pollLoop(): Promise<void> {
         while (this.isRunning) {
             try {
-                const files = fs.readdirSync(QUEUE_DIR).filter((f) => f.endsWith('.json'));
+                console.log('--- poll tick ---');
+                // const files = fs.readdirSync(QUEUE_DIR).filter((f) => f.endsWith('.json'));
+                const allFiles = fs.readdirSync(QUEUE_DIR);
+                console.log('All files in dir =', allFiles);
+
+                const files = allFiles.filter((f) => f.endsWith('.json'));
+                console.log('Matched json files =', files);
 
                 for (const file of files) {
                     const filepath = path.join(QUEUE_DIR, file);
@@ -53,6 +62,9 @@ export class QueuePoller {
                         const event: AnalysisRequestedEvent = JSON.parse(content);
 
                         console.log(`📨 Processing message: ${event.jobId}`);
+                        
+                        // capture playload
+                        capturePayload(event);
 
                         await this.processor.process(event);
 
