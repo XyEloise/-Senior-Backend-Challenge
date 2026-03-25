@@ -35,6 +35,7 @@ async function main() {
         { instagram_id: '67890', tiktok_id: '11111' }, // 这些会成功
         { instagram_id: '12345' },  // 🐛 这个会返回 null（老格式）
         { instagram_id: '99999', tiktok_id: '22222' }, // 这些会成功
+        //{ instagram_id: '11aaa', tiktok_id: '333bb' },
     ];
 
     console.log(`📊 Testing with ${testInfluencers.length} influencers:`);

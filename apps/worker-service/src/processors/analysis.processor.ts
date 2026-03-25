@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { Logger } from '@nestjs/common';
 import type {
     AnalysisRequestedEvent,
     Demographics,
@@ -18,6 +19,39 @@ type JobDocument = {
 };
 
 /**
+ * 严格校验后的第三方 audience payload 结构。
+ *
+ * 这里不再允许“缺字段时给默认值继续跑”，
+ * 而是要求进入 demographics 计算之前，数据必须满足最基本的业务契约。
+ */
+type StrictAudiencePayload = {
+    age: number;
+    gender: string;
+    country: string;
+    city?: string | null;
+    tags: string[];
+    score: number;
+};
+
+/**
+ * 带上下文的第三方数据校验异常。
+ *
+ * 目的：
+ * - 不再 silent fallback
+ * - 直接把 schema 问题暴露给上层
+ * - 便于日志、DLQ、重试、排障
+ */
+class ThirdPartyPayloadValidationError extends Error {
+    readonly context: Record<string, unknown>;
+
+    constructor(message: string, context: Record<string, unknown>) {
+        super(message);
+        this.name = 'ThirdPartyPayloadValidationError';
+        this.context = context;
+    }
+}
+
+/**
  * Analysis Processor - processes analysis jobs from the queue.
  *
  * 修复内容：
@@ -27,6 +61,7 @@ type JobDocument = {
  * 4. 对第三方 API 脏数据进行清洗与校验
  */
 export class AnalysisProcessor implements MessageProcessor {
+    private readonly logger = new Logger(AnalysisProcessor.name);
     private connection: mongoose.Connection | null = null;
 
     constructor() {
@@ -36,7 +71,7 @@ export class AnalysisProcessor implements MessageProcessor {
     private log(level: 'log' | 'warn' | 'error', message: string, context: Record<string, unknown> = {}): void {
         const entry = {
             level,
-            component: 'AnalysisProcessor',
+            component: AnalysisProcessor.name,
             message,
             timestamp: new Date().toISOString(),
             ...context,
@@ -44,14 +79,14 @@ export class AnalysisProcessor implements MessageProcessor {
 
         const line = JSON.stringify(entry);
         if (level === 'error') {
-            console.error(line);
+            this.logger.error(line);
             return;
         }
         if (level === 'warn') {
-            console.warn(line);
+            this.logger.warn(line);
             return;
         }
-        console.log(line);
+        this.logger.log(line);
     }
 
     private async initializeDatabase(): Promise<void> {
@@ -74,9 +109,14 @@ export class AnalysisProcessor implements MessageProcessor {
     }
 
     /**
-     * Processes an analysis request.
+     * 处理分析任务。
      *
-     * 状态流：PENDING -> PROCESSING -> COMPLETED / FAILED
+     * 状态流：
+     * PENDING -> PROCESSING -> COMPLETED / FAILED
+     *
+     * 改动点：
+     * - 如果第三方 payload 非法，不再伪装成成功结果
+     * - 直接进入 catch，记录失败，并由 markJobFailed 持久化
      */
     async process(event: AnalysisRequestedEvent): Promise<void> {
         const { jobId, dataUrl, traceId } = event;
@@ -170,16 +210,24 @@ export class AnalysisProcessor implements MessageProcessor {
         } catch (error) {
             const err = error as Error;
 
+            const extraContext =
+                error instanceof ThirdPartyPayloadValidationError
+                    ? { validationContext: error.context }
+                    : {};
+
             this.log('error', 'Processing failed', {
                 ...logContext,
+                ...extraContext,
                 stage: 'FAILED',
                 status: 'FAILED',
+                errorName: err.name,
                 errorMessage: err.message,
                 stack: err.stack,
             });
 
             await this.markJobFailed(jobId, err.message, {
                 ...logContext,
+                ...extraContext,
                 stage: 'FAILED_PERSIST',
             });
         }
@@ -236,186 +284,195 @@ export class AnalysisProcessor implements MessageProcessor {
      * - 不再直接 data.age as number
      * - 不再直接 data.tags as string[]
      * - 不再直接 data.score as number
+     * 坏数据 -> 抛异常 -> 任务失败 -> 上层处理
      */
     private transformApiResponseSafe(
         response: ThirdPartyApiResponse,
         logContext: Record<string, unknown>,
     ): Demographics {
-        if (!response.success || !response.data) {
-            this.log('warn', 'Third-party API returned empty or unsuccessful payload', {
-                ...logContext,
-                stage: 'NORMALIZE_RESPONSE',
-                apiSuccess: response.success,
-            });
+        const payload = this.validateAndParseThirdPartyPayload(response, logContext);
 
-            return {
-                ageRange: 'unknown',
-                gender: 'unknown',
-                location: 'unknown',
-                interests: [],
-                confidence: 0,
-            };
+        return {
+            ageRange: this.calculateAgeRange(payload.age),
+            gender: payload.gender,
+            location: this.buildLocation(payload.country, payload.city),
+            interests: payload.tags,
+            confidence: payload.score,
+        };
+    }
+
+    /**
+     * 对第三方返回做严格校验并解析。
+     *
+     * 只要有关键字段不满足契约，就直接抛出异常。
+     * 不再用 unknown / [] / 0 伪装成一个“看起来正常”的结果。
+     */
+    private validateAndParseThirdPartyPayload(
+        response: ThirdPartyApiResponse,
+        logContext: Record<string, unknown>,
+    ): StrictAudiencePayload {
+        if (!response.success) {
+            throw new ThirdPartyPayloadValidationError(
+                'Third-party API responded with success=false',
+                {
+                    ...logContext,
+                    stage: 'VALIDATE_THIRD_PARTY_RESPONSE',
+                    apiSuccess: response.success,
+                },
+            );
+        }
+
+        if (!this.isRecord(response.data)) {
+            throw new ThirdPartyPayloadValidationError(
+                'Third-party API payload is missing or not an object',
+                {
+                    ...logContext,
+                    stage: 'VALIDATE_THIRD_PARTY_RESPONSE',
+                    receivedDataType: typeof response.data,
+                    receivedData: response.data ?? null,
+                },
+            );
         }
 
         const data = response.data;
 
-        const age = this.normalizeAge(data.age, logContext);
-        const gender = this.normalizeGender(data.gender, logContext);
-        const location = this.normalizeLocation(data.country, data.city, logContext);
-        const interests = this.normalizeTags(data.tags, logContext);
-        const confidence = this.normalizeScore(data.score, logContext);
-
         return {
-            ageRange: this.calculateAgeRangeSafe(age),
-            gender,
-            location,
-            interests,
-            confidence,
+            age: this.requireFiniteNumber(data.age, 'age', logContext),
+            gender: this.requireNonEmptyString(data.gender, 'gender', logContext).toLowerCase(),
+            country: this.requireNonEmptyString(data.country, 'country', logContext),
+            city: this.optionalNullableString(data.city, 'city', logContext),
+            tags: this.requireStringArray(data.tags, 'tags', logContext),
+            score: this.requireFiniteNumber(data.score, 'score', logContext),
         };
     }
 
-    private normalizeAge(age: unknown, logContext: Record<string, unknown>): number | null {
-        if (typeof age === 'number' && Number.isFinite(age)) {
-            return age;
-        }
-
-        if (typeof age === 'string') {
-            const parsed = Number.parseInt(age, 10);
-            if (!Number.isNaN(parsed)) {
-                this.log('warn', 'Normalized non-numeric age string', {
-                    ...logContext,
-                    stage: 'NORMALIZE_AGE',
-                    originalAge: age,
-                    normalizedAge: parsed,
-                });
-                return parsed;
-            }
-        }
-
-        this.log('warn', 'Age missing or invalid', {
-            ...logContext,
-            stage: 'NORMALIZE_AGE',
-            originalAge: age ?? null,
-        });
-
-        return null;
-    }
-
-    private normalizeGender(gender: unknown, logContext: Record<string, unknown>): string {
-        if (typeof gender === 'string' && gender.trim().length > 0) {
-            return gender.trim().toLowerCase();
-        }
-
-        this.log('warn', 'Gender missing or invalid, defaulted to unknown', {
-            ...logContext,
-            stage: 'NORMALIZE_GENDER',
-            originalGender: gender ?? null,
-            normalizedGender: 'unknown',
-        });
-
-        return 'unknown';
-    }
-
-    private normalizeLocation(
-        country: unknown,
-        city: unknown,
-        logContext: Record<string, unknown>,
-    ): string {
-        if (typeof country === 'string' && country.trim().length > 0) {
-            return country.trim();
-        }
-
-        if (typeof city === 'string' && city.trim().length > 0) {
-            this.log('warn', 'Country missing, fallback to city', {
-                ...logContext,
-                stage: 'NORMALIZE_LOCATION',
-                originalCountry: country ?? null,
-                originalCity: city,
-                normalizedLocation: city.trim(),
-            });
-            return city.trim();
-        }
-
-        this.log('warn', 'Location missing, defaulted to unknown', {
-            ...logContext,
-            stage: 'NORMALIZE_LOCATION',
-            originalCountry: country ?? null,
-            originalCity: city ?? null,
-            normalizedLocation: 'unknown',
-        });
-
-        return 'unknown';
-    }
-
-    private normalizeTags(tags: unknown, logContext: Record<string, unknown>): string[] {
-        if (Array.isArray(tags)) {
-            return tags
-                .filter((tag): tag is string => typeof tag === 'string')
-                .map((tag) => tag.trim())
-                .filter(Boolean);
-        }
-
-        if (typeof tags === 'string') {
-            const normalizedTags = tags
-                .split(',')
-                .map((tag) => tag.trim())
-                .filter(Boolean);
-
-            this.log('warn', 'Normalized string tags into array', {
-                ...logContext,
-                stage: 'NORMALIZE_TAGS',
-                originalTags: tags,
-                normalizedTags,
-            });
-
-            return normalizedTags;
-        }
-
-        this.log('warn', 'Tags missing or invalid, defaulted to empty array', {
-            ...logContext,
-            stage: 'NORMALIZE_TAGS',
-            originalTags: tags ?? null,
-            normalizedTags: [],
-        });
-
-        return [];
-    }
-
-    private normalizeScore(score: unknown, logContext: Record<string, unknown>): number {
-        if (typeof score === 'number' && Number.isFinite(score)) {
-            return score;
-        }
-
-        if (typeof score === 'string') {
-            const parsed = Number.parseFloat(score);
-            if (!Number.isNaN(parsed)) {
-                this.log('warn', 'Normalized string score into number', {
-                    ...logContext,
-                    stage: 'NORMALIZE_SCORE',
-                    originalScore: score,
-                    normalizedScore: parsed,
-                });
-                return parsed;
-            }
-        }
-
-        this.log('warn', 'Score missing or invalid, defaulted to 0', {
-            ...logContext,
-            stage: 'NORMALIZE_SCORE',
-            originalScore: score ?? null,
-            normalizedScore: 0,
-        });
-
-        return 0;
+    /**
+     * 判断一个 unknown 是否为 object record。
+     */
+    private isRecord(value: unknown): value is Record<string, unknown> {
+        return typeof value === 'object' && value !== null && !Array.isArray(value);
     }
 
     /**
-     * ✅ 修复：安全年龄段计算
-     * 避免 null / 非法值导致错误年龄段
+     * 要求字段必须是有限 number。
+     * 否则抛出带上下文异常。
      */
-    private calculateAgeRangeSafe(age: number | null): string {
-        if (age === null || !Number.isFinite(age) || age < 0) {
-            return 'unknown';
+    private requireFiniteNumber(
+        value: unknown,
+        fieldName: string,
+        logContext: Record<string, unknown>,
+    ): number {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+        }
+
+        throw new ThirdPartyPayloadValidationError(
+            `Invalid third-party field: ${fieldName} must be a finite number`,
+            {
+                ...logContext,
+                stage: 'VALIDATE_FIELD',
+                fieldName,
+                receivedType: typeof value,
+                receivedValue: value ?? null,
+            },
+        );
+    }
+
+    /**
+     * 要求字段必须是非空字符串。
+     * 否则抛出带上下文异常。
+     */
+    private requireNonEmptyString(
+        value: unknown,
+        fieldName: string,
+        logContext: Record<string, unknown>,
+    ): string {
+        if (typeof value === 'string' && value.trim().length > 0) {
+            return value.trim();
+        }
+
+        throw new ThirdPartyPayloadValidationError(
+            `Invalid third-party field: ${fieldName} must be a non-empty string`,
+            {
+                ...logContext,
+                stage: 'VALIDATE_FIELD',
+                fieldName,
+                receivedType: typeof value,
+                receivedValue: value ?? null,
+            },
+        );
+    }
+
+    /**
+     * 可选字段：允许 string / null / undefined。
+     * 如果是别的类型，说明 schema 仍然有问题，也应直接暴露。
+     */
+    private optionalNullableString(
+        value: unknown,
+        fieldName: string,
+        logContext: Record<string, unknown>,
+    ): string | null {
+        if (value === undefined || value === null) {
+            return null;
+        }
+
+        if (typeof value === 'string') {
+            return value.trim();
+        }
+
+        throw new ThirdPartyPayloadValidationError(
+            `Invalid third-party field: ${fieldName} must be string | null | undefined`,
+            {
+                ...logContext,
+                stage: 'VALIDATE_FIELD',
+                fieldName,
+                receivedType: typeof value,
+                receivedValue: value,
+            },
+        );
+    }
+
+    /**
+     * 要求 tags 必须是 string[]。
+     * 不再接受逗号拼接字符串并偷偷 split。
+     *
+     * 这是故意的：
+     * - 以前这种做法属于 silent recovery
+     * - 现在要把 schema 问题直接暴露出来
+     */
+    private requireStringArray(
+        value: unknown,
+        fieldName: string,
+        logContext: Record<string, unknown>,
+    ): string[] {
+        if (
+            Array.isArray(value) &&
+            value.every((item) => typeof item === 'string' && item.trim().length > 0)
+        ) {
+            return value.map((item) => item.trim());
+        }
+
+        throw new ThirdPartyPayloadValidationError(
+            `Invalid third-party field: ${fieldName} must be a non-empty string array`,
+            {
+                ...logContext,
+                stage: 'VALIDATE_FIELD',
+                fieldName,
+                receivedType: Array.isArray(value) ? 'array' : typeof value,
+                receivedValue: value ?? null,
+            },
+        );
+    }
+
+    /**
+     * 年龄段计算。
+     *
+     * 这里不再需要 safe fallback，
+     * 因为 age 在进入这里之前已经完成严格校验。
+     */
+    private calculateAgeRange(age: number): string {
+        if (age < 0) {
+            throw new Error('Age cannot be negative after validation');
         }
 
         if (age < 18) return 'under-18';
@@ -426,8 +483,24 @@ export class AnalysisProcessor implements MessageProcessor {
         return '55+';
     }
 
+    /**
+     * 位置拼接逻辑。
+     *
+     * 这里不是 fallback：
+     * - country 是必填并且已经通过严格校验
+     * - city 是可选补充信息
+     */
+    private buildLocation(country: string, city?: string | null): string {
+        if (city && city.length > 0) {
+            return `${country}, ${city}`;
+        }
+
+        return country;
+    }
+
     private async findJob(jobId: string): Promise<JobDocument | null> {
         const collection = this.connection?.collection<JobDocument>('analysis_jobs');
+
         if (!collection) {
             throw new Error('Database not connected');
         }
@@ -443,6 +516,7 @@ export class AnalysisProcessor implements MessageProcessor {
         logContext: Record<string, unknown>,
     ): Promise<boolean> {
         const collection = this.connection?.collection('analysis_jobs');
+
         if (!collection) {
             throw new Error('Database not connected');
         }
@@ -479,11 +553,13 @@ export class AnalysisProcessor implements MessageProcessor {
         logContext: Record<string, unknown>,
     ): Promise<boolean> {
         const collection = this.connection?.collection('analysis_jobs');
+
         if (!collection) {
             throw new Error('Database not connected');
         }
 
         const now = new Date().toISOString();
+
         const result = await collection.updateOne(
             { jobId, status: 'PROCESSING', version: expectedVersion },
             {
@@ -515,6 +591,7 @@ export class AnalysisProcessor implements MessageProcessor {
         logContext: Record<string, unknown>,
     ): Promise<void> {
         const collection = this.connection?.collection('analysis_jobs');
+
         if (!collection) {
             return;
         }

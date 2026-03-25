@@ -14,7 +14,7 @@
         "start:worker": "pnpm --filter worker-service start:dev",
         "start:all": "concurrently \"pnpm start:legacy\" \"pnpm start:worker\"",
         "replay": "tsx scripts/replay-event.ts",
-        "process:chaos": "tsx scripts/process-chaos.ts",
+        "process:chaos": "pnpm exec ts-node --project tsconfig.process-chaos.json scripts/process-chaos.ts",
         "simulate:audience-bug": "tsx apps/worker-service/src/audience-integration/run-audience-test.ts",
         "test": "pnpm -r test",
         "lint": "pnpm -r lint"
@@ -22,11 +22,19 @@
     "devDependencies": {
         "@types/node": "^20.10.0",
         "concurrently": "^8.2.2",
+        "ts-node": "^10.9.2",
         "tsx": "^4.7.0",
-        "typescript": "^5.3.3"
+        "typescript": "^5.9.3"
     },
     "engines": {
         "node": ">=20.0.0"
     },
-    "packageManager": "pnpm@8.15.0"
+    "packageManager": "pnpm@8.15.0",
+    "dependencies": {
+        "@nestjs/common": "^10.3.0",
+        "class-transformer": "^0.5.1",
+        "class-validator": "^0.14.0",
+        "reflect-metadata": "^0.2.1",
+        "rxjs": "^7.8.1"
+    }
 }
