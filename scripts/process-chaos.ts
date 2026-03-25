@@ -180,123 +180,112 @@
 // // process.exit(1);
 
 
-/**
- * process-chaos.ts
- *
- * 目标：
- * 1. 读取 chaos-data-samples.json
- * 2. 使用 class-validator 做 runtime validation
- * 3. 合法记录正常处理
- * 4. 非法记录不 crash 整个 batch，而是记录日志并写入 failed-records/
- * 5. 所有日志都带 traceId，且使用 Nest Logger 而不是 console
- */
 
+import 'reflect-metadata';
 import fs from 'fs/promises';
 import path from 'path';
 import { Logger } from '@nestjs/common';
-import 'reflect-metadata';
+import { plainToInstance } from 'class-transformer';
 import {
   IsArray,
   IsEmail,
   IsInt,
   IsNumber,
-  IsOptional,
   IsString,
   Max,
   Min,
   MinLength,
-  validate,
+  ValidateIf,
   ValidationError,
+  validate,
 } from 'class-validator';
-import { plainToInstance } from 'class-transformer';
 
 /**
  * ===============================
- * 1. DTO / Schema 定义
+ * 1) DTO 定义
  * ===============================
  *
- * 说明：
- * - 这里用 class-validator 代替 zod，贴近 NestJS 生态
- * - 不做 fallback，不把脏数据偷偷转成“看起来正常”
- * - 字段 optional 表示“可缺失”
- * - 但如果字段出现了，就必须满足类型和约束
+ * 关键点：
+ * - 不使用 @IsOptional()
+ *   因为 @IsOptional() 会把 null 也跳过校验
+ * - 这里使用 @ValidateIf((_, value) => value !== undefined)
+ *   语义是：只有字段“缺失”时才跳过；如果字段存在，即使是 null，也必须校验并报错
+ *
+ * 这更符合题目中对 dirty data 的描述：
+ * - 有些 age 是 25
+ * - 有些 age 是 "25+"
+ * - 有些 age 是 null
+ * 上述 null 应该视为脏数据，而不是默默放过
  */
 class ChaosRecordDto {
   @IsString()
   @MinLength(1)
   id!: string;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsInt()
   @Min(1)
   age?: number;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsString()
   gender?: string;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsString()
   country?: string;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsString()
   city?: string;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsNumber()
   @Min(0)
   @Max(1)
   engagementScore?: number;
 
-  @IsOptional()
+  @ValidateIf((_, value) => value !== undefined)
   @IsEmail()
   email?: string;
 }
 
 /**
  * 失败记录结构
+ * 用于写入 failed-records/batch-xxx.json
  */
 interface FailedRecordEntry {
   recordId: string | null;
   traceId: string;
-  batchTraceId: string;
   reason: Array<{
     field: string;
-    messages: string[];
-    value: unknown;
+    message: string;
+    rawValue: unknown;
   }>;
   rawPayload: unknown;
   timestamp: string;
 }
 
 /**
- * 输入文件整体可能是纯数组，也可能未来扩展成：
- * { traceId, records: [...] }
- * 所以这里专门做一个解析函数，支持 traceId 透传。
- */
-interface ParsedInput {
-  batchTraceId: string;
-  records: unknown[];
-}
-
-/**
  * ===============================
- * 2. Logger 封装
+ * 2) Logger
  * ===============================
  *
- * 说明：
- * - 底层使用 Nest Logger
- * - 输出结构化 JSON 字符串
- * - 避免再手写 console.log / console.error
+ * 按题目要求：
+ * - 不再使用 console.log / console.error
+ * - 使用结构化日志
+ * - 每条日志都带 traceId
  */
 const logger = new Logger('ProcessChaosScript');
 
+/**
+ * 统一输出结构化日志
+ */
 function logStructured(
   level: 'log' | 'warn' | 'error',
   payload: Record<string, unknown>
@@ -316,163 +305,158 @@ function logStructured(
     case 'error':
       logger.error(message);
       break;
+    default:
+      logger.log(message);
   }
 }
 
 /**
  * ===============================
- * 3. 工具函数
+ * 3) 工具函数：安全获取嵌套字段值
  * ===============================
+ *
+ * 例如 path = "tags.0" 时，尝试从原始对象里取值
  */
+function getValueByPath(obj: unknown, fieldPath: string): unknown {
+  if (!fieldPath) {
+    return obj;
+  }
+
+  const segments = fieldPath.split('.');
+  let current: unknown = obj;
+
+  for (const segment of segments) {
+    if (current === null || current === undefined) {
+      return current;
+    }
+
+    if (typeof current !== 'object') {
+      return undefined;
+    }
+
+    current = (current as Record<string, unknown>)[segment];
+  }
+
+  return current;
+}
 
 /**
- * 将 class-validator 的错误格式整理成更适合日志 / DLQ 的结构
+ * ===============================
+ * 4) 将 class-validator 错误扁平化
+ * ===============================
+ *
+ * 输出格式示例：
+ * [
+ *   { field: "age", message: "age must not be less than 1", rawValue: "25+" }
+ * ]
  */
-function formatValidationErrors(
+function flattenValidationErrors(
   errors: ValidationError[],
-  raw: Record<string, unknown>
-): Array<{ field: string; messages: string[]; value: unknown }> {
-  return errors.map((error) => ({
-    field: error.property,
-    messages: error.constraints ? Object.values(error.constraints) : ['Unknown validation error'],
-    value: raw[error.property],
-  }));
+  rootPayload: unknown,
+  parentPath = ''
+): Array<{ field: string; message: string; rawValue: unknown }> {
+  const flattened: Array<{ field: string; message: string; rawValue: unknown }> =
+    [];
+
+  for (const error of errors) {
+    const currentPath = parentPath
+      ? `${parentPath}.${error.property}`
+      : error.property;
+
+    if (error.constraints) {
+      for (const message of Object.values(error.constraints)) {
+        flattened.push({
+          field: currentPath,
+          message,
+          rawValue: getValueByPath(rootPayload, currentPath),
+        });
+      }
+    }
+
+    if (error.children && error.children.length > 0) {
+      flattened.push(
+        ...flattenValidationErrors(error.children, rootPayload, currentPath)
+      );
+    }
+  }
+
+  return flattened;
 }
 
 /**
- * 解析输入文件。
+ * ===============================
+ * 5) 单条记录校验
+ * ===============================
  *
- * 支持两种输入形式：
- * 1) 直接数组：[{...}, {...}]
- * 2) 包装对象：{ traceId: "...", records: [{...}, {...}] }
- *
- * 注意：
- * - 这里不做“数据修复型 fallback”
- * - 如果整体文件结构错了，直接抛异常，让 main 的 catch 接管
+ * - 使用 plainToInstance 将原始对象转为 DTO
+ * - whitelist: false，因为题目没要求裁剪未知字段
+ * - forbidUnknownValues: true，用于拒绝明显不合法的顶层值
  */
-function parseInputFile(parsedJson: unknown): ParsedInput {
-  if (Array.isArray(parsedJson)) {
-    return {
-      batchTraceId: `chaos-batch-${Date.now()}`,
-      records: parsedJson,
-    };
-  }
-
-  if (
-    typeof parsedJson === 'object' &&
-    parsedJson !== null &&
-    'records' in parsedJson &&
-    Array.isArray((parsedJson as { records: unknown[] }).records)
-  ) {
-    const obj = parsedJson as { traceId?: unknown; records: unknown[] };
-
-    return {
-      batchTraceId:
-        typeof obj.traceId === 'string' && obj.traceId.trim().length > 0
-          ? obj.traceId
-          : `chaos-batch-${Date.now()}`,
-      records: obj.records,
-    };
-  }
-
-  throw new Error(
-    'Invalid input file format: expected an array of records or an object with a records array.'
-  );
-}
-
-/**
- * 单条记录校验。
- *
- * 说明：
- * - forbidUnknownValues: true，避免奇怪对象绕过
- * - whitelist: false，因为题目没有要求删除未知字段
- * - 不做 transform / implicit conversion，
- *   因为 "25+"、"0.72" 这类数据不应该被偷偷转成 number
- */
-async function validateRecord(raw: unknown): Promise<{
-  success: true;
-  data: ChaosRecordDto;
-} | {
-  success: false;
-  errors: Array<{ field: string; messages: string[]; value: unknown }>;
+async function validateRecord(
+  rawRecord: unknown
+): Promise<{
+  isValid: boolean;
+  dto?: ChaosRecordDto;
+  errors?: Array<{ field: string; message: string; rawValue: unknown }>;
 }> {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return {
-      success: false,
-      errors: [
-        {
-          field: 'record',
-          messages: ['Record must be a non-null object'],
-          value: raw,
-        },
-      ],
-    };
-  }
+  const dto = plainToInstance(ChaosRecordDto, rawRecord);
 
-  const instance = plainToInstance(ChaosRecordDto, raw);
-
-  const errors = await validate(instance, {
+  const validationErrors = await validate(dto, {
     whitelist: false,
     forbidUnknownValues: true,
-    validationError: {
-      target: false,
-      value: false,
-    },
   });
 
-  if (errors.length > 0) {
+  if (validationErrors.length > 0) {
     return {
-      success: false,
-      errors: formatValidationErrors(errors, raw as Record<string, unknown>),
+      isValid: false,
+      errors: flattenValidationErrors(validationErrors, rawRecord),
     };
   }
 
   return {
-    success: true,
-    data: instance,
+    isValid: true,
+    dto,
   };
 }
 
 /**
- * 模拟业务处理。
- *
- * 真实项目里，这里可能会：
- * - 调用 service
- * - 写数据库
- * - 发消息到队列
- *
- * 这里不做默认值补全，保证“坏数据不会伪装成好数据”
- */
-async function processValidRecord(record: ChaosRecordDto, traceId: string): Promise<void> {
-  logStructured('log', {
-    event: 'RecordProcessed',
-    traceId,
-    recordId: record.id,
-  });
-}
-
-/**
  * ===============================
- * 4. 主流程
+ * 6) 主流程
  * ===============================
  */
 async function main(): Promise<void> {
-  const inputPath = path.resolve(process.cwd(), 'debug-payloads/chaos-data-samples.json');
-  const failedDir = path.resolve(process.cwd(), 'failed-records');
+  /**
+   * 题目要求 traceId 从 LegacyApp 透传。
+   * 这个独立脚本没有真实上游调用方，因此这里生成一个 batch 级 traceId 来模拟。
+   */
+  const traceId = `chaos-batch-${Date.now()}`;
+
+  /**
+   * 路径说明：
+   * 假设本脚本位于 scripts/process-chaos.ts
+   * 数据位于 debug-payloads/chaos-data-samples.json
+   * 输出位于 failed-records/
+   */
+  const projectRoot = path.resolve(__dirname, '..');
+  const inputPath = path.join(projectRoot, 'debug-payloads', 'chaos-data-samples.json');
+  const failedDir = path.join(projectRoot, 'failed-records');
 
   await fs.mkdir(failedDir, { recursive: true });
 
-  const rawFileContent = await fs.readFile(inputPath, 'utf-8');
-  const parsedJson: unknown = JSON.parse(rawFileContent);
-
-  const { batchTraceId, records } = parseInputFile(parsedJson);
-
   logStructured('log', {
-    event: 'ChaosBatchStarted',
-    traceId: batchTraceId,
+    event: 'BatchStarted',
+    traceId,
     inputPath,
-    totalRecords: records.length,
   });
+
+  const rawFileContent = await fs.readFile(inputPath, 'utf-8');
+  const parsed = JSON.parse(rawFileContent) as unknown;
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('Input JSON must be an array of records.');
+  }
+
+  const records = parsed;
 
   let processed = 0;
   let skipped = 0;
@@ -480,103 +464,164 @@ async function main(): Promise<void> {
   const failedRecords: FailedRecordEntry[] = [];
 
   for (const rawRecord of records) {
-    /**
-     * 单条记录也支持透传 traceId；
-     * 若没有，则回退到 batchTraceId。
-     *
-     * 这里的“回退”不是业务字段 fallback，
-     * 而是 observability 上的 trace 继承，这是合理的。
-     */
-    const recordTraceId =
+    const recordId =
+      rawRecord &&
       typeof rawRecord === 'object' &&
-      rawRecord !== null &&
-      'traceId' in rawRecord &&
-      typeof (rawRecord as { traceId?: unknown }).traceId === 'string'
-        ? ((rawRecord as { traceId: string }).traceId)
-        : batchTraceId;
+      'id' in rawRecord &&
+      typeof (rawRecord as Record<string, unknown>).id === 'string'
+        ? ((rawRecord as Record<string, unknown>).id as string)
+        : null;
 
-    const validationResult = await validateRecord(rawRecord);
+    try {
+      const result = await validateRecord(rawRecord);
 
-    if (!validationResult.success) {
+      if (!result.isValid) {
+        skipped++;
+
+        logStructured('warn', {
+          event: 'ValidationFailed',
+          traceId,
+          jobId: 'chaos-data-batch',
+          recordId,
+          errors: result.errors,
+        });
+
+        failedRecords.push({
+          recordId,
+          traceId,
+          reason: result.errors ?? [],
+          rawPayload: rawRecord,
+          timestamp: new Date().toISOString(),
+        });
+
+        continue;
+      }
+
+      /**
+       * 这里模拟“正常处理”
+       * 面试题重点不是业务处理逻辑，而是：
+       * - 校验
+       * - 日志
+       * - 跳过坏数据
+       * - dead letter
+       */
+      processed++;
+
+      logStructured('log', {
+        event: 'RecordProcessed',
+        traceId,
+        jobId: 'chaos-data-batch',
+        recordId: result.dto?.id ?? recordId,
+      });
+    } catch (error) {
+      /**
+       * 防御式编程：
+       * 即使单条记录处理过程中出现非校验类异常，也不能让整个 batch 崩掉
+       */
       skipped++;
 
-      const recordId =
-        typeof rawRecord === 'object' &&
-        rawRecord !== null &&
-        'id' in rawRecord &&
-        typeof (rawRecord as { id?: unknown }).id === 'string'
-          ? (rawRecord as { id: string }).id
-          : null;
+      const message =
+        error instanceof Error ? error.message : 'Unknown processing error';
 
-      logStructured('warn', {
-        event: 'ValidationFailed',
-        traceId: recordTraceId,
-        batchTraceId,
+      logStructured('error', {
+        event: 'RecordProcessingCrashed',
+        traceId,
+        jobId: 'chaos-data-batch',
         recordId,
-        errors: validationResult.errors,
+        error: message,
       });
 
       failedRecords.push({
         recordId,
-        traceId: recordTraceId,
-        batchTraceId,
-        reason: validationResult.errors,
+        traceId,
+        reason: [
+          {
+            field: '_record',
+            message,
+            rawValue: rawRecord,
+          },
+        ],
         rawPayload: rawRecord,
         timestamp: new Date().toISOString(),
       });
-
-      continue;
     }
-
-    await processValidRecord(validationResult.data, recordTraceId);
-    processed++;
   }
 
-  let failedRelativePath: string | null = null;
+  /**
+   * ===============================
+   * 7) Dead Letter 输出
+   * ===============================
+   */
+  let failedOutputRelativePath = 'N/A';
 
   if (failedRecords.length > 0) {
-    const batchFile = `batch-${Date.now()}.json`;
-    const failedPath = path.join(failedDir, batchFile);
+    const batchFileName = `batch-${Date.now()}.json`;
+    const failedOutputPath = path.join(failedDir, batchFileName);
 
-    await fs.writeFile(failedPath, JSON.stringify(failedRecords, null, 2), 'utf-8');
-    failedRelativePath = `failed-records/${batchFile}`;
+    await fs.writeFile(
+      failedOutputPath,
+      JSON.stringify(failedRecords, null, 2),
+      'utf-8'
+    );
+
+    failedOutputRelativePath = `failed-records/${batchFileName}`;
 
     logStructured('warn', {
-      event: 'DeadLetterSaved',
-      traceId: batchTraceId,
+      event: 'DeadLetterWritten',
+      traceId,
+      outputPath: failedOutputRelativePath,
       failedCount: failedRecords.length,
-      outputPath: failedRelativePath,
     });
   }
 
-  logger.log('');
+  /**
+   * ===============================
+   * 8) 结果输出
+   * ===============================
+   *
+   * 注意：
+   * 按题意严格处理 null 等脏数据后，
+   * 这份样本更合理的结果应是：
+   *   Processed: 5
+   *   Skipped: 7
+   *
+   * 因为 present-but-null 不应被当成“正常缺失”
+   */
   logger.log(`✅ Processed: ${processed} records`);
   logger.log(`⚠️ Skipped (validation failed): ${skipped} records`);
-  logger.log(
-    failedRelativePath
-      ? `📁 Failed records saved to: ${failedRelativePath}`
-      : '📁 No failed records',
-  );
+
+  if (failedRecords.length > 0) {
+    logger.log(`📁 Failed records saved to: ${failedOutputRelativePath}`);
+  } else {
+    logger.log('📁 No failed records');
+  }
+
+  logStructured('log', {
+    event: 'BatchCompleted',
+    traceId,
+    processed,
+    skipped,
+    failedRecordsOutput: failedOutputRelativePath,
+  });
 }
 
 /**
- * 顶层异常只负责处理“批次级致命错误”，例如：
+ * 顶层兜底：
+ * 只处理“批次级”致命异常，例如：
  * - 文件不存在
- * - JSON 解析失败
- * - 输入格式整体错误
+ * - JSON 格式非法
  *
- * 单条坏记录不应该走这里，而应进入 validation + DLQ
+ * 这种异常说明整个输入环境有问题，脚本应退出非 0
  */
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : 'Unknown fatal error';
-  const stack = error instanceof Error ? error.stack : undefined;
 
   logger.error(
     JSON.stringify({
       timestamp: new Date().toISOString(),
-      event: 'ChaosBatchFatalError',
-      message,
-      stack,
+      event: 'BatchFatalError',
+      traceId: `fatal-${Date.now()}`,
+      error: message,
     })
   );
 
