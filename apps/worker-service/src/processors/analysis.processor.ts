@@ -68,43 +68,40 @@ export class AnalysisProcessor implements MessageProcessor {
         void this.initializeDatabase();
     }
 
-    private log(level: 'log' | 'warn' | 'error', message: string, context: Record<string, unknown> = {}): void {
-        const entry = {
+    private formatLog(
+        level: 'log' | 'warn' | 'error',
+        message: string,
+        context: Record<string, unknown> = {},
+    ): string {
+        return JSON.stringify({
             level,
             component: AnalysisProcessor.name,
             message,
             timestamp: new Date().toISOString(),
             ...context,
-        };
-
-        const line = JSON.stringify(entry);
-        if (level === 'error') {
-            this.logger.error(line);
-            return;
-        }
-        if (level === 'warn') {
-            this.logger.warn(line);
-            return;
-        }
-        this.logger.log(line);
+        });
     }
 
     private async initializeDatabase(): Promise<void> {
         try {
             await mongoose.connect(MONGODB_URI);
             this.connection = mongoose.connection;
-            this.log('log', 'Connected to MongoDB', {
-                stage: 'DB_CONNECT',
-                mongoUri: MONGODB_URI,
-            });
+            this.logger.log(
+                this.formatLog('log', 'Connected to MongoDB', {
+                    stage: 'DB_CONNECT',
+                    mongoUri: MONGODB_URI,
+                }),
+            );
         } catch (error) {
             const err = error as Error;
-            this.log('error', 'Failed to connect to MongoDB', {
-                stage: 'DB_CONNECT',
-                mongoUri: MONGODB_URI,
-                errorMessage: err.message,
-                stack: err.stack,
-            });
+            this.logger.error(
+                this.formatLog('error', 'Failed to connect to MongoDB', {
+                    stage: 'DB_CONNECT',
+                    mongoUri: MONGODB_URI,
+                    errorMessage: err.message,
+                    stack: err.stack,
+                }),
+            );
         }
     }
 
@@ -126,18 +123,22 @@ export class AnalysisProcessor implements MessageProcessor {
             dataUrl,
         };
 
-        this.log('log', 'Received analysis event', {
-            ...logContext,
-            stage: 'EVENT_RECEIVED',
-        });
+        this.logger.log(
+            this.formatLog('log', 'Received analysis event', {
+                ...logContext,
+                stage: 'EVENT_RECEIVED',
+            }),
+        );
 
         try {
             const currentJob = await this.findJob(jobId);
             if (!currentJob) {
-                this.log('error', 'Job not found', {
-                    ...logContext,
-                    stage: 'LOAD_JOB',
-                });
+                this.logger.error(
+                    this.formatLog('error', 'Job not found', {
+                        ...logContext,
+                        stage: 'LOAD_JOB',
+                    }),
+                );
                 return;
             }
 
@@ -155,31 +156,37 @@ export class AnalysisProcessor implements MessageProcessor {
             );
 
             if (!locked) {
-                this.log('warn', 'Skipped processing because optimistic lock failed', {
-                    ...logContext,
-                    stage: 'SET_PROCESSING',
-                    expectedVersion: currentVersion,
-                    status: 'PENDING',
-                });
+                this.logger.warn(
+                    this.formatLog('warn', 'Skipped processing because optimistic lock failed', {
+                        ...logContext,
+                        stage: 'SET_PROCESSING',
+                        expectedVersion: currentVersion,
+                        status: 'PENDING',
+                    }),
+                );
                 return;
             }
 
             const apiResponse = await this.callThirdPartyApi(dataUrl);
 
-            this.log('log', 'Third-party API responded', {
-                ...logContext,
-                stage: 'THIRD_PARTY_RESPONSE',
-                apiSuccess: apiResponse.success,
-                rawData: apiResponse.data ?? null,
-            });
+            this.logger.log(
+                this.formatLog('log', 'Third-party API responded', {
+                    ...logContext,
+                    stage: 'THIRD_PARTY_RESPONSE',
+                    apiSuccess: apiResponse.success,
+                    rawData: apiResponse.data ?? null,
+                }),
+            );
 
             const demographics = this.transformApiResponseSafe(apiResponse, logContext);
 
-            this.log('log', 'Normalized demographics payload', {
-                ...logContext,
-                stage: 'NORMALIZATION_COMPLETED',
-                demographics,
-            });
+            this.logger.log(
+                this.formatLog('log', 'Normalized demographics payload', {
+                    ...logContext,
+                    stage: 'NORMALIZATION_COMPLETED',
+                    demographics,
+                }),
+            );
 
             const completed = await this.updateJobWithResults(
                 jobId,
@@ -192,21 +199,25 @@ export class AnalysisProcessor implements MessageProcessor {
             );
 
             if (!completed) {
-                this.log('warn', 'Skipped final write because optimistic lock failed', {
-                    ...logContext,
-                    stage: 'PERSIST_RESULT',
-                    expectedVersion: currentVersion + 1,
-                    status: 'PROCESSING',
-                });
+                this.logger.warn(
+                    this.formatLog('warn', 'Skipped final write because optimistic lock failed', {
+                        ...logContext,
+                        stage: 'PERSIST_RESULT',
+                        expectedVersion: currentVersion + 1,
+                        status: 'PROCESSING',
+                    }),
+                );
                 return;
             }
 
-            this.log('log', 'Job completed', {
-                ...logContext,
-                stage: 'COMPLETED',
-                status: 'COMPLETED',
-                demographics,
-            });
+            this.logger.log(
+                this.formatLog('log', 'Job completed', {
+                    ...logContext,
+                    stage: 'COMPLETED',
+                    status: 'COMPLETED',
+                    demographics,
+                }),
+            );
         } catch (error) {
             const err = error as Error;
 
@@ -215,15 +226,17 @@ export class AnalysisProcessor implements MessageProcessor {
                     ? { validationContext: error.context }
                     : {};
 
-            this.log('error', 'Processing failed', {
-                ...logContext,
-                ...extraContext,
-                stage: 'FAILED',
-                status: 'FAILED',
-                errorName: err.name,
-                errorMessage: err.message,
-                stack: err.stack,
-            });
+            this.logger.error(
+                this.formatLog('error', 'Processing failed', {
+                    ...logContext,
+                    ...extraContext,
+                    stage: 'FAILED',
+                    status: 'FAILED',
+                    errorName: err.name,
+                    errorMessage: err.message,
+                    stack: err.stack,
+                }),
+            );
 
             await this.markJobFailed(jobId, err.message, {
                 ...logContext,
@@ -534,14 +547,16 @@ export class AnalysisProcessor implements MessageProcessor {
             },
         );
 
-        this.log('log', 'Attempted job status transition', {
-            ...logContext,
-            fromStatus,
-            toStatus,
-            expectedVersion,
-            matchedCount: result.matchedCount,
-            modifiedCount: result.modifiedCount,
-        });
+        this.logger.log(
+            this.formatLog('log', 'Attempted job status transition', {
+                ...logContext,
+                fromStatus,
+                toStatus,
+                expectedVersion,
+                matchedCount: result.matchedCount,
+                modifiedCount: result.modifiedCount,
+            }),
+        );
 
         return result.modifiedCount === 1;
     }
@@ -575,12 +590,14 @@ export class AnalysisProcessor implements MessageProcessor {
             },
         );
 
-        this.log('log', 'Attempted to persist final job result', {
-            ...logContext,
-            expectedVersion,
-            matchedCount: result.matchedCount,
-            modifiedCount: result.modifiedCount,
-        });
+        this.logger.log(
+            this.formatLog('log', 'Attempted to persist final job result', {
+                ...logContext,
+                expectedVersion,
+                matchedCount: result.matchedCount,
+                modifiedCount: result.modifiedCount,
+            }),
+        );
 
         return result.modifiedCount === 1;
     }
@@ -610,11 +627,14 @@ export class AnalysisProcessor implements MessageProcessor {
             },
         );
 
-        this.log('log', 'Marked job as FAILED', {
-            ...logContext,
-            matchedCount: result.matchedCount,
-            modifiedCount: result.modifiedCount,
-            errorMessage,
-        });
+        this.logger.log(
+            this.formatLog('log', 'Marked job as FAILED', {
+                ...logContext,
+                matchedCount: result.matchedCount,
+                modifiedCount: result.modifiedCount,
+                errorMessage,
+            }),
+        );
     }
 }
+
